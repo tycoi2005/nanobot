@@ -130,6 +130,7 @@ class _FakeBuilder:
 def _make_telegram_update(
     *,
     chat_type: str = "group",
+    chat_id: int = -100123,
     text: str | None = None,
     caption: str | None = None,
     entities=None,
@@ -139,7 +140,7 @@ def _make_telegram_update(
     user = SimpleNamespace(id=12345, username="alice", first_name="Alice")
     message = SimpleNamespace(
         chat=SimpleNamespace(type=chat_type, is_forum=False),
-        chat_id=-100123,
+        chat_id=chat_id,
         text=text,
         caption=caption,
         entities=entities or [],
@@ -445,6 +446,12 @@ def test_telegram_group_policy_defaults_to_mention() -> None:
     assert TelegramConfig().group_policy == "mention"
 
 
+def test_telegram_group_allow_from_accepts_camel_alias() -> None:
+    config = TelegramConfig.model_validate({"groupAllowFrom": ["-100123"]})
+
+    assert config.group_allow_from == ["-100123"]
+
+
 def test_is_allowed_accepts_legacy_telegram_id_username_formats() -> None:
     channel = TelegramChannel(TelegramConfig(allow_from=["12345", "alice", "67890|bob"]), MessageBus())
 
@@ -671,6 +678,89 @@ async def test_group_policy_open_accepts_plain_group_message() -> None:
 
     assert len(handled) == 1
     assert channel._app.bot.get_me_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_group_allow_from_ignores_non_whitelisted_group_message() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(
+            enabled=True,
+            token="123:abc",
+            allow_from=["*"],
+            group_policy="open",
+            group_allow_from=["-100123"],
+        ),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+
+    handled = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+    channel._start_typing = lambda _chat_id: None
+
+    await channel._on_message(_make_telegram_update(text="hello group", chat_id=-100999), None)
+
+    assert handled == []
+
+
+@pytest.mark.asyncio
+async def test_group_allow_from_accepts_whitelisted_group_message() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(
+            enabled=True,
+            token="123:abc",
+            allow_from=["*"],
+            group_policy="open",
+            group_allow_from=["-100123"],
+        ),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+
+    handled = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+    channel._start_typing = lambda _chat_id: None
+
+    await channel._on_message(_make_telegram_update(text="hello group", chat_id=-100123), None)
+
+    assert len(handled) == 1
+
+
+@pytest.mark.asyncio
+async def test_group_allow_from_does_not_block_private_chat() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(
+            enabled=True,
+            token="123:abc",
+            allow_from=["*"],
+            group_allow_from=["-100123"],
+        ),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+
+    handled = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+    channel._start_typing = lambda _chat_id: None
+
+    await channel._on_message(
+        _make_telegram_update(text="hello private", chat_type="private", chat_id=12345),
+        None,
+    )
+
+    assert len(handled) == 1
 
 
 @pytest.mark.asyncio
@@ -1028,6 +1118,32 @@ async def test_forward_command_normalizes_telegram_safe_dream_aliases() -> None:
 
     assert len(handled) == 1
     assert handled[0]["content"] == "/dream-restore deadbeef"
+
+
+@pytest.mark.asyncio
+async def test_forward_command_ignores_non_whitelisted_group() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(
+            enabled=True,
+            token="123:abc",
+            allow_from=["*"],
+            group_policy="open",
+            group_allow_from=["-100123"],
+        ),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    handled = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+    update = _make_telegram_update(text="/new", chat_id=-100999)
+
+    await channel._forward_command(update, None)
+
+    assert handled == []
 
 
 @pytest.mark.asyncio
