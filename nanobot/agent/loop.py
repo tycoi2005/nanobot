@@ -67,15 +67,43 @@ class _LoopHook(AgentHook):
         self._message_id = message_id
         self._stream_buf = ""
 
+    @staticmethod
+    def _trim_partial_reasoning_prefix(text: str) -> str:
+        """Trim trailing partial reasoning tag prefixes during streaming."""
+        lower = text.lower()
+        partials = (
+            "</thought",
+            "</thoug",
+            "</thou",
+            "</tho",
+            "</th",
+            "</t",
+            "</",
+            "<thought",
+            "<thoug",
+            "<thou",
+            "<tho",
+            "<think",
+            "<thin",
+            "<thi",
+            "<th",
+            "<t",
+            "<",
+        )
+        for prefix in partials:
+            if lower.endswith(prefix):
+                return text[:-len(prefix)]
+        return text
+
     def wants_streaming(self) -> bool:
         return self._on_stream is not None
 
     async def on_stream(self, context: AgentHookContext, delta: str) -> None:
         from nanobot.utils.helpers import strip_think
 
-        prev_clean = strip_think(self._stream_buf)
+        prev_clean = self._trim_partial_reasoning_prefix(strip_think(self._stream_buf))
         self._stream_buf += delta
-        new_clean = strip_think(self._stream_buf)
+        new_clean = self._trim_partial_reasoning_prefix(strip_think(self._stream_buf))
         incremental = new_clean[len(prev_clean):]
         if incremental and self._on_stream:
             await self._on_stream(incremental)

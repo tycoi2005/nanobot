@@ -837,6 +837,32 @@ async def test_loop_stream_filter_handles_think_only_prefix_without_crashing(tmp
 
 
 @pytest.mark.asyncio
+async def test_loop_stream_filter_holds_partial_angle_bracket_until_reasoning_tag_is_complete(tmp_path):
+    loop = _make_loop(tmp_path)
+    deltas: list[str] = []
+
+    async def chat_stream_with_retry(*, on_content_delta, **kwargs):
+        await on_content_delta("<")
+        await on_content_delta("thought>* internal")
+        await on_content_delta(" chain</thought>Dạ thưa anh")
+        return LLMResponse(
+            content="<thought>* internal chain</thought>Dạ thưa anh",
+            tool_calls=[],
+            usage={},
+        )
+
+    loop.provider.chat_stream_with_retry = chat_stream_with_retry
+
+    async def on_stream(delta: str) -> None:
+        deltas.append(delta)
+
+    final_content, _, _ = await loop._run_agent_loop([], on_stream=on_stream)
+
+    assert final_content == "Dạ thưa anh"
+    assert deltas == ["Dạ thưa anh"]
+
+
+@pytest.mark.asyncio
 async def test_loop_retries_think_only_final_response(tmp_path):
     loop = _make_loop(tmp_path)
     call_count = {"n": 0}
