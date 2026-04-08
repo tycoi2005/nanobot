@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import importlib.util
+import json
 import os
 import secrets
 import string
@@ -241,6 +242,26 @@ class OpenAICompatProvider(LLMProvider):
                         continue
                     tc_clean = dict(tc)
                     tc_clean["id"] = map_id(tc_clean.get("id"))
+                    fn = tc_clean.get("function")
+                    if isinstance(fn, dict):
+                        fn_clean = dict(fn)
+                        raw_args = fn_clean.get("arguments")
+                        if isinstance(raw_args, str):
+                            try:
+                                parsed_args = json_repair.loads(raw_args)
+                            except Exception:
+                                parsed_args = {"raw": raw_args}
+                        elif isinstance(raw_args, dict):
+                            parsed_args = raw_args
+                        elif raw_args is None:
+                            parsed_args = {}
+                        else:
+                            parsed_args = {"raw": raw_args}
+
+                        if not isinstance(parsed_args, dict):
+                            parsed_args = {"raw": raw_args if raw_args is not None else ""}
+                        fn_clean["arguments"] = json.dumps(parsed_args, ensure_ascii=False)
+                        tc_clean["function"] = fn_clean
                     normalized.append(tc_clean)
                 clean["tool_calls"] = normalized
                 if clean.get("role") == "assistant":

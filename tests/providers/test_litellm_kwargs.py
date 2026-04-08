@@ -9,6 +9,7 @@ Validates that:
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -582,6 +583,52 @@ def test_openai_compat_keeps_tool_calls_after_consecutive_assistant_messages() -
     assert sanitized[1]["content"] is None
     assert sanitized[1]["tool_calls"][0]["id"] == "3ec83c30d"
     assert sanitized[2]["tool_call_id"] == "3ec83c30d"
+
+
+def test_openai_compat_sanitize_normalizes_non_string_tool_arguments() -> None:
+    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI"):
+        provider = OpenAICompatProvider()
+
+    sanitized = provider._sanitize_messages([
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "fn", "arguments": {"path": "README.md"}},
+                }
+            ],
+        }
+    ])
+
+    raw_args = sanitized[0]["tool_calls"][0]["function"]["arguments"]
+    assert isinstance(raw_args, str)
+    assert json.loads(raw_args) == {"path": "README.md"}
+
+
+def test_openai_compat_sanitize_repairs_invalid_tool_argument_json() -> None:
+    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI"):
+        provider = OpenAICompatProvider()
+
+    sanitized = provider._sanitize_messages([
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "fn", "arguments": '{"path": "README.md",}'},
+                }
+            ],
+        }
+    ])
+
+    raw_args = sanitized[0]["tool_calls"][0]["function"]["arguments"]
+    assert isinstance(raw_args, str)
+    assert json.loads(raw_args) == {"path": "README.md"}
 
 
 @pytest.mark.asyncio
