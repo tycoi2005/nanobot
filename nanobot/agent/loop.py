@@ -674,6 +674,20 @@ class AgentLoop:
 
         session, pending = self.auto_compact.prepare_session(session, key)
 
+        # Channels can request persistence-only logging for a message.
+        if msg.metadata.get("_store_only"):
+            session.add_message(
+                "user",
+                msg.content,
+                media=msg.media,
+                channel=msg.channel,
+                sender_id=msg.sender_id,
+                metadata=msg.metadata,
+            )
+            self.sessions.save(session)
+            self._schedule_background(self.consolidator.maybe_consolidate_by_tokens(session))
+            return None
+
         # Slash commands
         raw = msg.content.strip()
         ctx = CommandContext(msg=msg, session=session, key=key, raw=raw, loop=self)
