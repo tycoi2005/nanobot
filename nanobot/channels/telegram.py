@@ -939,7 +939,31 @@ class TelegramChannel(BaseChannel):
 
         if not await self._is_group_message_for_bot(message):
             if self.config.log_all_messages:
+                content_parts = []
+                media_paths = []
+
+                if message.text:
+                    content_parts.append(message.text)
+                if message.caption:
+                    content_parts.append(message.caption)
+
+                if message.location:
+                    lat = message.location.latitude
+                    lon = message.location.longitude
+                    content_parts.append(f"[location: {lat}, {lon}]")
+
+                current_media_paths, current_media_parts = await self._download_message_media(
+                    message, add_failure_content=True
+                )
+                media_paths.extend(current_media_paths)
+                content_parts.extend(current_media_parts)
+
+                content = "\n".join(content_parts) if content_parts else "[empty message]"
+                str_chat_id = str(chat_id)
+                metadata = self._build_message_metadata(message, user)
+                session_key = self._derive_topic_session_key(message)
                 silent_metadata = {**metadata, "_store_only": True}
+
                 await self._handle_message(
                     sender_id=sender_id,
                     chat_id=str_chat_id,
