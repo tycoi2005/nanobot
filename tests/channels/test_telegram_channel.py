@@ -1350,6 +1350,28 @@ async def test_forward_command_normalizes_telegram_safe_dream_aliases() -> None:
 
 
 @pytest.mark.asyncio
+async def test_forward_command_ignores_command_for_different_bot() -> None:
+    """Commands with @other_bot suffix should be ignored, not processed."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], group_policy="open"),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    handled = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+    # Command is for @other_bot, not @nanobot_test
+    update = _make_telegram_update(text="/status@other_bot", reply_to_message=None)
+
+    await channel._forward_command(update, None)
+
+    assert handled == []
+
+
+@pytest.mark.asyncio
 async def test_forward_command_ignores_non_whitelisted_group() -> None:
     channel = TelegramChannel(
         TelegramConfig(

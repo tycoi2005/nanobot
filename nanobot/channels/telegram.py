@@ -905,12 +905,20 @@ class TelegramChannel(BaseChannel):
         user = update.effective_user
         self._remember_thread_context(message)
 
-        # Strip @bot_username suffix if present
         content = message.text or ""
+        # Handle @bot_username suffix in commands
         if content.startswith("/") and "@" in content:
-            cmd_part, *rest = content.split(" ", 1)
-            cmd_part = cmd_part.split("@")[0]
-            content = f"{cmd_part} {rest[0]}" if rest else cmd_part
+            bot_id, bot_username = await self._ensure_bot_identity()
+            if bot_username:
+                handle = f"@{bot_username}".lower()
+                cmd_part, *rest = content.split(" ", 1)
+                if handle in cmd_part.lower():
+                    # Command is for this bot - strip the @username
+                    cmd_part = cmd_part.split("@")[0]
+                    content = f"{cmd_part} {rest[0]}" if rest else cmd_part
+                else:
+                    # Command is for a different bot - ignore it
+                    return
         content = self._normalize_telegram_command(content)
 
         await self._handle_message(
