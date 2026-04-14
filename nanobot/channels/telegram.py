@@ -255,6 +255,9 @@ class TelegramChannel(BaseChannel):
         # sender_id format: "id|name" or "id|name [BOT]" or "id|username"
         parts = sender_str.split("|", 1)
         sid = parts[0]
+        if not sid.isdigit():
+            return False
+            
         # Remove [BOT] suffix from name/username for matching if present
         remainder = parts[1].replace(" [BOT]", "").strip()
 

@@ -821,7 +821,8 @@ async def test_group_policy_open_accepts_plain_group_message() -> None:
     await channel._on_message(_make_telegram_update(text="hello group"), None)
 
     assert len(handled) == 1
-    assert channel._app.bot.get_me_calls == 0
+    # We now call get_me once for loop prevention even in open mode.
+    assert channel._app.bot.get_me_calls == 1
 
 
 @pytest.mark.asyncio
@@ -1640,3 +1641,73 @@ def test_sender_id_formatting():
     # Case 4: Neither present -> just ID
     user_none = MagicMock(id=101, username=None, full_name=None, first_name=None, is_bot=False)
     assert channel._sender_id(user_none) == "101"
+
+@pytest.mark.asyncio
+async def test_reply_to_bot_tagging():
+    """Verify detailed reply tagging scenarios."""
+    from nanobot.channels.telegram import TelegramChannel, TelegramConfig
+    from nanobot.bus.queue import MessageBus
+    from unittest.mock import MagicMock, AsyncMock
+    import pytest
+
+    def _make_mock_message(text=None, caption=None):
+        msg = MagicMock()
+        msg.text = text
+        msg.caption = caption
+        msg.location = None
+        msg.photo = None
+        msg.voice = None
+        msg.audio = None
+        msg.document = None
+        msg.video = None
+        msg.video_note = None
+        msg.animation = None
+        msg.media_group_id = None
+        msg.reply_to_message = None
+        return msg
+
+    channel = TelegramChannel(TelegramConfig(enabled=True, token="123:abc"), MessageBus())
+    channel._bot_user_id = 123
+    channel._bot_username = "nanobot"
+    channel._handle_message = AsyncMock()
+    channel._start_typing = MagicMock()
+    channel._add_reaction = AsyncMock()
+
+    # Case 1: Reply to bot
+    reply = _make_mock_message(text="Bot message")
+    reply.from_user.id = 123
+    update = MagicMock()
+    update.message = _make_mock_message(text="Reply to bot")
+    update.message.reply_to_message = reply
+    update.message.from_user.id = 456
+    update.message.chat.type = "private"
+    update.effective_user = update.message.from_user
+    await channel._on_message(update, None)
+    assert "[Reply to bot: Bot message]" in channel._handle_message.call_args[1]["content"]
+
+    # Case 2: Reply to user with username
+    reply = _make_mock_message(text="User message")
+    reply.from_user.id = 789
+    reply.from_user.username = "alice"
+    update.message.reply_to_message = reply
+    await channel._on_message(update, None)
+    assert "[Reply to @alice: User message]" in channel._handle_message.call_args[1]["content"]
+
+    # Case 3: Reply to user without username
+    reply = _make_mock_message(text="Hidden user")
+    reply.from_user.id = 789
+    reply.from_user.username = None
+    reply.from_user.first_name = "Bob"
+    update.message.reply_to_message = reply
+    await channel._on_message(update, None)
+    assert "[Reply to Bob: Hidden user]" in channel._handle_message.call_args[1]["content"]
+
+    # Case 4: Reply to media only
+    reply = _make_mock_message()
+    reply.photo = [MagicMock()]
+    reply.from_user.id = 789
+    reply.from_user.username = "pic_sender"
+    update.message.reply_to_message = reply
+    channel._download_message_media = AsyncMock(side_effect=[([], []), (["/tmp/p.jpg"], ["[image: /tmp/p.jpg]"])])
+    await channel._on_message(update, None)
+    assert "[Reply to: [image: /tmp/p.jpg]]" in channel._handle_message.call_args[1]["content"]
