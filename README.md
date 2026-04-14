@@ -21,6 +21,7 @@
 
 ## 📢 News
 
+- **2026-04-14** 🛡️ Added **Restricted Mode** and privilege-aware tool access — unprivileged users are now isolated from sensitive system info and tools.
 - **2026-04-05** 🚀 Released **v0.1.5** — sturdier long-running tasks, Dream two-stage memory, production-ready sandboxing and programming Agent SDK. Please see [release notes](https://github.com/HKUDS/nanobot/releases/tag/v0.1.5) for details.
 - **2026-04-04** 🚀 Jinja2 response templates, Dream memory hardened, smarter retry handling.
 - **2026-04-03** 🧠 Xiaomi MiMo provider, chain-of-thought reasoning visible, Telegram UX polish.
@@ -1556,6 +1557,30 @@ MCP tools are automatically discovered and registered on startup. The LLM can us
 | `tools.exec.enable` | `true` | When `false`, the shell `exec` tool is not registered at all. Use this to completely disable shell command execution. |
 | `tools.exec.pathAppend` | `""` | Extra directories to append to `PATH` when running shell commands (e.g. `/usr/sbin` for `ufw`). |
 | `channels.*.allowFrom` | `[]` (deny all) | Whitelist of user IDs. Empty denies all; use `["*"]` to allow everyone. |
+
+#### Access Control & Privilege Isolation
+
+nanobot implements strict privilege isolation to protect your server and data when interacting with multiple users.
+
+- **Privileged Users**: Users explicitly listed in `allowFrom` for a channel are considered "privileged". They have access to all tools (including file editing and shell execution) and can see the full system prompt, including long-term memory and history.
+- **Restricted Mode**: Unprivileged users (allowed via `["*"]` but not explicitly in `allowFrom`) are automatically put into **Restricted Mode**.
+    - **Tool Filtering**: Sensitive tools (`read_file`, `exec`, etc.) are hidden from the agent.
+    - **Prompt Isolation**: The system prompt skips loading bootstrap files, memory, and history. The agent is strictly instructed not to discuss or access server internals.
+    - **Auditing**: Any attempt by the agent to call a restricted tool for an unprivileged user is blocked and logged as a `WARNING`.
+
+**Configure Admin Tools:**
+
+By default, `CLI_TOOLS` (file and shell tools) require privileges. You can customize this list in `config.json`:
+
+```json
+{
+  "tools": {
+    "adminTools": ["read_file", "write_file", "exec", "my_custom_sensitive_tool"]
+  }
+}
+```
+
+If `adminTools` is `null` (default), nanobot uses its internal `CLI_TOOLS` list.
 
 **Docker security**: The official Docker image runs as a non-root user (`nanobot`, UID 1000) with bubblewrap pre-installed. When using `docker-compose.yml`, the container drops all Linux capabilities except `SYS_ADMIN` (required for bwrap's namespace isolation).
 
