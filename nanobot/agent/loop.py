@@ -133,6 +133,12 @@ class AgentLoop:
     _RUNTIME_CHECKPOINT_KEY = "runtime_checkpoint"
     _PENDING_USER_TURN_KEY = "pending_user_turn"
 
+    # Tools that require explicit allowFrom privilege in the channel config.
+    CLI_TOOLS = frozenset({
+        "read_file", "write_file", "edit_file", "list_dir", "grep", "glob",
+        "exec", "notebook_edit", "spawn"
+    })
+
     def __init__(
         self,
         bus: MessageBus,
@@ -156,12 +162,14 @@ class AgentLoop:
         hooks: list[AgentHook] | None = None,
         unified_session: bool = False,
         disabled_skills: list[str] | None = None,
+        tools_config: "ToolsConfig | None" = None,
     ):
         from nanobot.config.schema import ExecToolConfig, WebToolsConfig
 
         defaults = AgentDefaults()
         self.bus = bus
         self.channels_config = channels_config
+        self.tools_config = tools_config
         self.provider = provider
         self.workspace = workspace
         self.model = model or provider.get_default_model()
@@ -329,6 +337,46 @@ class AgentLoop:
 
         return format_tool_hints(tool_calls)
 
+    def _is_strict_policy(self, channel_name: str) -> bool:
+        """True if the channel has an explicit allow-list of user IDs."""
+        if channel_name == "cli":
+            return True
+        if not self.channels_config:
+            return False
+        cfg = self.channels_config.model_extra.get(channel_name)
+        if not isinstance(cfg, dict):
+            return False
+        allow_from = cfg.get("allowFrom") or cfg.get("allow_from", [])
+        if not allow_from:
+            return False
+        # If it's just ["*"], it's not a strict policy (back to old logic).
+        if len(allow_from) == 1 and allow_from[0] == "*":
+            return False
+        return True
+
+    def _is_privileged(self, channel_name: str, sender_id: str) -> bool:
+        """Check if sender_id has explicit permission to use CLI tools in this channel."""
+        if channel_name == "cli":
+            return True
+        if not self._is_strict_policy(channel_name):
+            # Back to old logic: if no strict allow-list, everyone who can talk is privileged.
+            return True
+        if not self.channels_config or not sender_id:
+            return False
+        cfg = self.channels_config.model_extra.get(channel_name)
+        if not isinstance(cfg, dict):
+            return False
+        allow_from = cfg.get("allowFrom") or cfg.get("allow_from", [])
+
+        # Support "id|name" format by checking both the full string and just the ID part
+        sender_str = str(sender_id)
+        is_allowed = sender_str in allow_from
+        if not is_allowed and "|" in sender_str:
+            sid = sender_str.split("|")[0]
+            is_allowed = sid in allow_from
+
+        return is_allowed
+
     def _effective_session_key(self, msg: InboundMessage) -> str:
         """Return the session key used for task routing and mid-turn injections."""
         if self._unified_session and not msg.session_key_override:
@@ -345,6 +393,7 @@ class AgentLoop:
         session: Session | None = None,
         channel: str = "cli",
         chat_id: str = "direct",
+        sender_id: str = "user",
         message_id: str | None = None,
         pending_queue: asyncio.Queue | None = None,
     ) -> tuple[str | None, list[str], list[dict], str, bool]:
@@ -403,9 +452,42 @@ class AgentLoop:
                 items.append({"role": "user", "content": merged})
             return items
 
+        # Point 1: Filter tools if the user is not privileged (explicitly in allowFrom).
+        run_tools = self.tools
+        is_privileged = self._is_privileged(channel, sender_id)
+        if not is_privileged:
+            run_tools = ToolRegistry()
+            admin_tools = self.CLI_TOOLS
+            if self.tools_config and self.tools_config.admin_tools is not None:
+                admin_tools = frozenset(self.tools_config.admin_tools)
+
+            for name in self.tools.tool_names:
+                # We block admin tools and MCP tools for unprivileged users.
+                if name not in admin_tools and not name.startswith("mcp_"):
+                    if tool := self.tools.get(name):
+                        run_tools.register(tool)
+
+        async def _log_unauthorized_tool(payload: dict[str, Any]) -> None:
+            await _checkpoint(payload)
+            if not is_privileged and payload.get("phase") == "awaiting_tools":
+                for tc in payload.get("pending_tool_calls", []):
+                    name = tc.get("function", {}).get("name")
+                    # Use the same admin_tools set here (fall back to CLI_TOOLS)
+                    check_tools = self.CLI_TOOLS
+                    if self.tools_config and self.tools_config.admin_tools is not None:
+                        check_tools = frozenset(self.tools_config.admin_tools)
+
+                    if name in check_tools or (name and name.startswith("mcp_")):
+                        logger.warning(
+                            "Unauthorized tool call attempt by {}: {}({})",
+                            sender_id,
+                            name,
+                            json.dumps(tc.get("function", {}).get("arguments", {}), ensure_ascii=False),
+                        )
+
         result = await self.runner.run(AgentRunSpec(
             initial_messages=initial_messages,
-            tools=self.tools,
+            tools=run_tools,
             model=self.model,
             max_iterations=self.max_iterations,
             max_tool_result_chars=self.max_tool_result_chars,
@@ -418,7 +500,7 @@ class AgentLoop:
             context_block_limit=self.context_block_limit,
             provider_retry_mode=self.provider_retry_mode,
             progress_callback=on_progress,
-            checkpoint_callback=_checkpoint,
+            checkpoint_callback=_log_unauthorized_tool,
             injection_callback=_drain_pending,
         ))
         self._last_usage = result.usage
@@ -636,14 +718,18 @@ class AgentLoop:
             history = session.get_history(max_messages=0)
             current_role = "assistant" if msg.sender_id == "subagent" else "user"
 
+            is_privileged = self._is_privileged(channel, msg.sender_id)
             messages = self.context.build_messages(
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id,
                 session_summary=pending,
                 current_role=current_role,
+                is_privileged=is_privileged,
+                sender_id=msg.sender_id,
             )
             final_content, _, all_msgs, _, _ = await self._run_agent_loop(
                 messages, session=session, channel=channel, chat_id=chat_id,
+                sender_id=msg.sender_id,
                 message_id=msg.metadata.get("message_id"),
             )
             self._save_turn(session, all_msgs, 1 + len(history))
@@ -688,6 +774,7 @@ class AgentLoop:
                 message_tool.start_turn()
 
         history = session.get_history(max_messages=0)
+        is_privileged = self._is_privileged(msg.channel, msg.sender_id)
 
         initial_messages = self.context.build_messages(
             history=history,
@@ -696,6 +783,8 @@ class AgentLoop:
             media=msg.media if msg.media else None,
             channel=msg.channel,
             chat_id=msg.chat_id,
+            is_privileged=is_privileged,
+            sender_id=msg.sender_id,
         )
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
@@ -732,6 +821,7 @@ class AgentLoop:
             session=session,
             channel=msg.channel,
             chat_id=msg.chat_id,
+            sender_id=msg.sender_id,
             message_id=msg.metadata.get("message_id"),
             pending_queue=pending_queue,
         )
