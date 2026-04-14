@@ -375,6 +375,7 @@ class AgentLoop:
             sid = sender_str.split("|")[0]
             is_allowed = sid in allow_from
 
+        logger.debug("Privilege check for {}:{}: {}", channel_name, sender_id, is_allowed)
         return is_allowed
 
     def _effective_session_key(self, msg: InboundMessage) -> str:
