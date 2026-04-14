@@ -831,6 +831,7 @@ class TelegramChannel(BaseChannel):
         bot_info = await self._app.bot.get_me()
         self._bot_user_id = getattr(bot_info, "id", None)
         self._bot_username = getattr(bot_info, "username", None)
+        logger.debug("Telegram bot identity: id={}, username={}", self._bot_user_id, self._bot_username)
         return self._bot_user_id, self._bot_username
 
     @staticmethod
@@ -1055,6 +1056,19 @@ class TelegramChannel(BaseChannel):
         metadata = self._build_message_metadata(message, user)
         session_key = self._derive_topic_session_key(message)
 
+        # Apply permission check before visual feedback (typing/reaction)
+        if not self.is_allowed(sender_id):
+            # Still call _handle_message so it can log the denial
+            await self._handle_message(
+                sender_id=sender_id,
+                chat_id=str_chat_id,
+                content=content,
+                media=media_paths,
+                metadata=metadata,
+                session_key=session_key,
+            )
+            return
+
         # Telegram media groups: buffer briefly, forward as one aggregated turn.
         if media_group_id := getattr(message, "media_group_id", None):
             key = f"{str_chat_id}:{media_group_id}"
@@ -1075,7 +1089,7 @@ class TelegramChannel(BaseChannel):
                 self._media_group_tasks[key] = asyncio.create_task(self._flush_media_group(key))
             return
 
-        # Start typing indicator before processing
+        # Start typing indicator before processing (for allowed users)
         self._start_typing(str_chat_id)
         await self._add_reaction(str_chat_id, message.message_id, self.config.react_emoji)
 
