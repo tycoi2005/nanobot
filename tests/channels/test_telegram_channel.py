@@ -1617,22 +1617,26 @@ async def test_send_text_bad_request_plain_fallback_exhausted() -> None:
     # Before the fix: 2 total. After the fix: still 2 (BadRequest SHOULD fallback).
     assert call_count == 2, f"Expected 2 calls (1 HTML + 1 plain), got {call_count}"
 
-def test_sender_id_with_first_name():
-    """_sender_id should include first_name if username is missing."""
+def test_sender_id_formatting():
+    """_sender_id should include full name and bot status correctly."""
     from nanobot.channels.telegram import TelegramChannel, TelegramConfig
     from nanobot.bus.queue import MessageBus
     from unittest.mock import MagicMock
     
     channel = TelegramChannel(TelegramConfig(enabled=True, token="123:abc"), MessageBus())
     
-    # Case 1: Both username and first_name present -> prefer username
-    user_both = MagicMock(id=123, username="alice", first_name="AliceName")
+    # Case 1: Username present (prefers username)
+    user_both = MagicMock(id=123, username="alice", full_name="Alice Name", is_bot=False)
     assert channel._sender_id(user_both) == "123|alice"
     
-    # Case 2: Only first_name present -> use first_name
-    user_first = MagicMock(id=456, username=None, first_name="Bob")
-    assert channel._sender_id(user_first) == "456|Bob"
+    # Case 2: Only full_name present
+    user_full = MagicMock(id=456, username=None, full_name="Bob Smith", is_bot=False)
+    assert channel._sender_id(user_full) == "456|Bob Smith"
     
-    # Case 3: Neither present -> just ID
-    user_none = MagicMock(id=789, username=None, first_name=None)
-    assert channel._sender_id(user_none) == "789"
+    # Case 3: Bot status included
+    user_bot = MagicMock(id=789, username="helper_bot", full_name="Helper Bot", is_bot=True)
+    assert channel._sender_id(user_bot) == "789|helper_bot [BOT]"
+    
+    # Case 4: Neither present -> just ID
+    user_none = MagicMock(id=101, username=None, full_name=None, first_name=None, is_bot=False)
+    assert channel._sender_id(user_none) == "101"
