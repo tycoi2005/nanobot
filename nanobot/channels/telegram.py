@@ -247,15 +247,18 @@ class TelegramChannel(BaseChannel):
         if not allow_list or "*" in allow_list:
             return False
 
+        # If no pipe, we already checked it via super().is_allowed()
         sender_str = str(sender_id)
-        if sender_str.count("|") != 1:
+        if "|" not in sender_str:
             return False
 
-        sid, username = sender_str.split("|", 1)
-        if not sid.isdigit() or not username:
-            return False
+        # sender_id format: "id|name" or "id|name [BOT]" or "id|username"
+        parts = sender_str.split("|", 1)
+        sid = parts[0]
+        # Remove [BOT] suffix from name/username for matching if present
+        remainder = parts[1].replace(" [BOT]", "").strip()
 
-        return sid in allow_list or username in allow_list
+        return sid in allow_list or remainder in allow_list
 
     async def _handle_message(
         self,
@@ -909,6 +912,12 @@ class TelegramChannel(BaseChannel):
         """Forward slash commands to the bus for unified handling in AgentLoop."""
         if not update.message or not update.effective_user:
             return
+
+        # Skip messages from the bot itself
+        bot_id, _ = await self._ensure_bot_identity()
+        if bot_id and update.effective_user.id == bot_id:
+            return
+
         message = update.message
         if not self._is_group_allowed(message):
             return
@@ -942,6 +951,11 @@ class TelegramChannel(BaseChannel):
     async def _on_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming messages (text, photos, voice, documents)."""
         if not update.message or not update.effective_user:
+            return
+
+        # Skip messages from the bot itself to avoid loops
+        bot_id, _ = await self._ensure_bot_identity()
+        if bot_id and update.effective_user.id == bot_id:
             return
 
         message = update.message
