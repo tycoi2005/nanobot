@@ -740,13 +740,19 @@ class TelegramChannel(BaseChannel):
 
     @staticmethod
     def _sender_id(user) -> str:
-        """Build sender_id with username or first_name for allowlist matching and logging."""
+        """Build sender_id with username or full_name for allowlist matching and logging."""
         sid = str(user.id)
+        is_bot = " [BOT]" if getattr(user, "is_bot", False) else ""
+        
         if user.username:
-            return f"{sid}|{user.username}"
-        if user.first_name:
-            return f"{sid}|{user.first_name}"
-        return sid
+            return f"{sid}|{user.username}{is_bot}"
+        
+        # Use full_name (combines first and last) for better identification
+        name = getattr(user, "full_name", None) or user.first_name or ""
+        if name:
+            return f"{sid}|{name}{is_bot}"
+            
+        return f"{sid}{is_bot}"
 
     @staticmethod
     def _derive_topic_session_key(message) -> str | None:
