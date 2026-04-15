@@ -716,11 +716,13 @@ def gateway(
         if isinstance(cron_tool, CronTool):
             cron_token = cron_tool.set_cron_context(True)
         try:
+            logger.info("Cron: running job '{}' for {}:{} (sender: {})", job.name, job.payload.channel or "cli", job.payload.to or "direct", job.payload.sender_id or "user")
             resp = await agent.process_direct(
                 reminder_note,
                 session_key=f"cron:{job.id}",
                 channel=job.payload.channel or "cli",
                 chat_id=job.payload.to or "direct",
+                sender_id=job.payload.sender_id or "user",
             )
         finally:
             if isinstance(cron_tool, CronTool) and cron_token is not None:
