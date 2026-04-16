@@ -269,7 +269,7 @@ class TestSubagentCancellation:
 
         monkeypatch.setattr("nanobot.agent.tools.filesystem.ListDirTool.execute", fake_execute)
 
-        await mgr._run_subagent("sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"})
+        await mgr._run_subagent("sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"}, is_privileged=True)
 
         assistant_messages = [
             msg for msg in captured_second_call
@@ -308,7 +308,7 @@ class TestSubagentCancellation:
 
         mgr.runner.run = AsyncMock(side_effect=fake_run)
 
-        await mgr._run_subagent("sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"})
+        await mgr._run_subagent("sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"}, is_privileged=True)
 
         mgr.runner.run.assert_awaited_once()
         mgr._announce_result.assert_awaited_once()
@@ -344,7 +344,7 @@ class TestSubagentCancellation:
 
         monkeypatch.setattr("nanobot.agent.tools.filesystem.ListDirTool.execute", fake_execute)
 
-        await mgr._run_subagent("sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"})
+        await mgr._run_subagent("sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"}, is_privileged=True)
 
         mgr._announce_result.assert_awaited_once()
         args = mgr._announce_result.await_args.args
@@ -389,7 +389,7 @@ class TestSubagentCancellation:
         monkeypatch.setattr("nanobot.agent.tools.filesystem.ListDirTool.execute", fake_execute)
 
         task = asyncio.create_task(
-            mgr._run_subagent("sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"})
+            mgr._run_subagent("sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"}, is_privileged=True)
         )
         mgr._running_tasks["sub-1"] = task
         mgr._session_tasks["test:c1"] = {"sub-1"}

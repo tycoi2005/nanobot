@@ -138,7 +138,6 @@ class _LoopHook(AgentHook):
         for tc in context.tool_calls:
             args_str = json.dumps(tc.arguments, ensure_ascii=False)
             logger.info("Tool call: {}({})", tc.name, args_str[:200])
-        self._loop._set_tool_context(self._channel, self._chat_id, self._message_id)
 
     async def after_iteration(self, context: AgentHookContext) -> None:
         u = context.usage or {}
@@ -349,17 +348,7 @@ class AgentLoop:
         finally:
             self._mcp_connecting = False
 
-    def _set_tool_context(self, channel: str, chat_id: str, sender_id: str, message_id: str | None = None) -> None:
-        """Update context for all tools that need routing info."""
-        for name in ("message", "spawn", "cron"):
-            if tool := self.tools.get(name):
-                if hasattr(tool, "set_context"):
-                    if name == "message":
-                        tool.set_context(channel, chat_id, message_id)
-                    elif name == "cron":
-                        tool.set_context(channel, chat_id, sender_id)
-                    else:
-                        tool.set_context(channel, chat_id)
+
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
@@ -452,7 +441,7 @@ class AgentLoop:
         ``resuming=True`` means tool calls follow (spinner should restart);
         ``resuming=False`` means this is the final response.
 
-        Returns (final_content, tools_used, messages, stop_reason, had_injections).
+        Returns (final_content, tools_used, messages, stop_reason, had_injections, run_tools).
         """
         loop_hook = _LoopHook(
             self,
@@ -501,22 +490,32 @@ class AgentLoop:
             return items
 
         # Point 1: Filter tools if the user is not privileged (explicitly in allowFrom).
-        run_tools = self.tools
+        # We also separate stateful tool instances per run to avoid concurrency races.
+        import copy
+        run_tools = ToolRegistry()
         is_privileged = privileged if privileged is not None else self._is_privileged(channel, sender_id)
-        if not is_privileged:
-            run_tools = ToolRegistry()
-            admin_tools = self.CLI_TOOLS
-            if (
-                self.tools_config
-                and self.tools_config.admin_tools is not None
-            ):
-                admin_tools = frozenset(self.tools_config.admin_tools)
+        
+        admin_tools = self.CLI_TOOLS
+        if self.tools_config and self.tools_config.admin_tools is not None:
+            admin_tools = frozenset(self.tools_config.admin_tools)
 
-            for name in self.tools.tool_names:
-                # We block admin tools and MCP tools for unprivileged users.
-                if name not in admin_tools and not name.startswith("mcp_"):
-                    if tool := self.tools.get(name):
-                        run_tools.register(tool)
+        for name in self.tools.tool_names:
+            if not is_privileged and (name in admin_tools or name.startswith("mcp_")):
+                continue
+                
+            if tool := self.tools.get(name):
+                # Separate context for stateful tools to avoid race conditions
+                if name in ("message", "spawn", "cron"):
+                    tool = copy.copy(tool)
+                    if name == "message":
+                        tool.set_context(channel, chat_id, message_id)
+                        tool.start_turn()
+                    elif name == "cron":
+                        tool.set_context(channel, chat_id, sender_id)
+                    elif name == "spawn":
+                        tool.set_context(channel, chat_id, is_privileged)
+                    
+                run_tools.register(tool)
 
         async def _log_unauthorized_tool(payload: dict[str, Any]) -> None:
             await _checkpoint(payload)
@@ -562,7 +561,7 @@ class AgentLoop:
             logger.warning("Max iterations ({}) reached", self.max_iterations)
         elif result.stop_reason == "error":
             logger.error("LLM returned error: {}", (result.final_content or "")[:200])
-        return result.final_content, result.tools_used, result.messages, result.stop_reason, result.had_injections
+        return result.final_content, result.tools_used, result.messages, result.stop_reason, result.had_injections, run_tools
 
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
@@ -782,7 +781,7 @@ class AgentLoop:
             session, pending = self.auto_compact.prepare_session(session, key)
 
             await self.consolidator.maybe_consolidate_by_tokens(session)
-            self._set_tool_context(channel, chat_id, msg.sender_id, msg.metadata.get("message_id"))
+
             history = session.get_history(max_messages=0)
             current_role = "assistant" if msg.sender_id == "subagent" else "user"
             is_privileged = privileged if privileged is not None else self._is_privileged(channel, msg.sender_id)
@@ -795,7 +794,7 @@ class AgentLoop:
                 is_privileged=is_privileged,
                 sender_id=msg.sender_id,
             )
-            final_content, _, all_msgs, _, _ = await self._run_agent_loop(
+            final_content, _, all_msgs, _, _, _ = await self._run_agent_loop(
                 messages, session=session, channel=channel, chat_id=chat_id,
                 sender_id=msg.sender_id,
                 message_id=msg.metadata.get("message_id"),
@@ -851,11 +850,6 @@ class AgentLoop:
 
         await self.consolidator.maybe_consolidate_by_tokens(session)
 
-        self._set_tool_context(msg.channel, msg.chat_id, msg.sender_id, msg.metadata.get("message_id"))
-        if message_tool := self.tools.get("message"):
-            if isinstance(message_tool, MessageTool):
-                message_tool.start_turn()
-
         history = session.get_history(max_messages=0)
         is_privileged = privileged if privileged is not None else self._is_privileged(msg.channel, msg.sender_id)
 
@@ -896,7 +890,7 @@ class AgentLoop:
             self.sessions.save(session)
             user_persisted_early = True
 
-        final_content, _, all_msgs, stop_reason, had_injections = await self._run_agent_loop(
+        final_content, _, all_msgs, stop_reason, had_injections, run_tools = await self._run_agent_loop(
             initial_messages,
             on_progress=on_progress or _bus_progress,
             on_stream=on_stream,
@@ -927,7 +921,7 @@ class AgentLoop:
         # However, if the turn falls back to the empty-final-response
         # placeholder, suppress it when the real user-visible output already
         # came from MessageTool.
-        if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
+        if (mt := run_tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             if not had_injections or stop_reason == "empty_final_response":
                 return None
 

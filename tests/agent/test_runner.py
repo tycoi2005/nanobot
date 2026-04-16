@@ -864,7 +864,7 @@ async def test_loop_max_iterations_message_stays_stable(tmp_path):
     loop.tools.execute = AsyncMock(return_value="ok")
     loop.max_iterations = 2
 
-    final_content, _, _, _, _ = await loop._run_agent_loop([])
+    final_content, _, _, _, _, _ = await loop._run_agent_loop([])
 
     assert final_content == (
         "I reached the maximum number of tool call iterations (2) "
@@ -891,7 +891,7 @@ async def test_loop_stream_filter_handles_think_only_prefix_without_crashing(tmp
     async def on_stream_end(*, resuming: bool = False) -> None:
         endings.append(resuming)
 
-    final_content, _, _, _, _ = await loop._run_agent_loop(
+    final_content, _, _, _, _, _ = await loop._run_agent_loop(
         [],
         on_stream=on_stream,
         on_stream_end=on_stream_end,
@@ -922,7 +922,7 @@ async def test_loop_stream_filter_holds_partial_angle_bracket_until_reasoning_ta
     async def on_stream(delta: str) -> None:
         deltas.append(delta)
 
-    final_content, _, _, _, _ = await loop._run_agent_loop([], on_stream=on_stream)
+    final_content, _, _, _, _, _ = await loop._run_agent_loop([], on_stream=on_stream)
 
     assert final_content == "Dạ thưa anh"
     assert deltas == ["Dạ thưa anh"]
@@ -943,7 +943,7 @@ async def test_loop_stream_filter_drops_orphan_thought_closer_before_text(tmp_pa
     async def on_stream(delta: str) -> None:
         deltas.append(delta)
 
-    final_content, _, _, _, _ = await loop._run_agent_loop([], on_stream=on_stream)
+    final_content, _, _, _, _, _ = await loop._run_agent_loop([], on_stream=on_stream)
 
     assert final_content == "Dạ thưa Master, em đã..."
     assert deltas == ["Dạ thưa Master, em đã..."]
@@ -968,7 +968,7 @@ async def test_loop_stream_filter_drops_orphan_thought_closer_after_text(tmp_pat
     async def on_stream(delta: str) -> None:
         deltas.append(delta)
 
-    final_content, _, _, _, _ = await loop._run_agent_loop([], on_stream=on_stream)
+    final_content, _, _, _, _, _ = await loop._run_agent_loop([], on_stream=on_stream)
 
     assert final_content == "Dạ thưa Master, em đã sửa xong rồi ạ!"
     assert deltas == ["Dạ thưa Master, em đã sửa xong rồi ạ!"]
@@ -987,7 +987,7 @@ async def test_loop_retries_think_only_final_response(tmp_path):
 
     loop.provider.chat_with_retry = chat_with_retry
 
-    final_content, _, _, _, _ = await loop._run_agent_loop([])
+    final_content, _, _, _, _, _ = await loop._run_agent_loop([])
 
     assert final_content == "Recovered answer"
     assert call_count["n"] == 2
@@ -1168,7 +1168,7 @@ async def test_subagent_max_iterations_announces_existing_fallback(tmp_path, mon
 
     monkeypatch.setattr("nanobot.agent.tools.filesystem.ListDirTool.execute", fake_execute)
 
-    await mgr._run_subagent("sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"})
+    await mgr._run_subagent("sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"}, is_privileged=True)
 
     mgr._announce_result.assert_awaited_once()
     args = mgr._announce_result.await_args.args
@@ -2203,7 +2203,7 @@ async def test_loop_injected_followup_preserves_image_media(tmp_path):
         media=[str(image_path)],
     ))
 
-    final_content, _, _, _, had_injections = await loop._run_agent_loop(
+    final_content, _, _, _, had_injections, _ = await loop._run_agent_loop(
         [{"role": "user", "content": "hello"}],
         channel="cli",
         chat_id="c",
@@ -2441,7 +2441,7 @@ async def test_pending_queue_preserves_overflow_for_next_injection_cycle(tmp_pat
             content=f"follow-up-{idx}",
         ))
 
-    final_content, _, _, _, had_injections = await loop._run_agent_loop(
+    final_content, _, _, _, had_injections, _ = await loop._run_agent_loop(
         [{"role": "user", "content": "hello"}],
         channel="cli",
         chat_id="c",

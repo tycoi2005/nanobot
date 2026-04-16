@@ -61,6 +61,7 @@ class SubagentManager:
         exec_config: "ExecToolConfig | None" = None,
         restrict_to_workspace: bool = False,
         disabled_skills: list[str] | None = None,
+        tools_config: "ToolsConfig | None" = None,
     ):
         from nanobot.config.schema import ExecToolConfig
 
@@ -73,6 +74,7 @@ class SubagentManager:
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
         self.disabled_skills = set(disabled_skills or [])
+        self.tools_config = tools_config
         self.runner = AgentRunner(provider)
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._session_tasks: dict[str, set[str]] = {}  # session_key -> {task_id, ...}
@@ -84,6 +86,7 @@ class SubagentManager:
         origin_channel: str = "cli",
         origin_chat_id: str = "direct",
         session_key: str | None = None,
+        is_privileged: bool = False,
     ) -> str:
         """Spawn a subagent to execute a task in the background."""
         task_id = str(uuid.uuid4())[:8]
@@ -91,7 +94,7 @@ class SubagentManager:
         origin = {"channel": origin_channel, "chat_id": origin_chat_id}
 
         bg_task = asyncio.create_task(
-            self._run_subagent(task_id, task, display_label, origin)
+            self._run_subagent(task_id, task, display_label, origin, is_privileged)
         )
         self._running_tasks[task_id] = bg_task
         if session_key:
@@ -115,23 +118,34 @@ class SubagentManager:
         task: str,
         label: str,
         origin: dict[str, str],
+        is_privileged: bool = False,
     ) -> None:
         """Execute the subagent task and announce the result."""
         logger.info("Subagent [{}] starting task: {}", task_id, label)
 
         try:
+            # Determine admin_tools from config
+            admin_tools = frozenset({"read_file", "write_file", "edit_file", "list_dir", "grep", "glob", "exec", "notebook_edit", "spawn"})
+            if self.tools_config and self.tools_config.admin_tools is not None:
+                admin_tools = frozenset(self.tools_config.admin_tools)
+
+            def register_if_allowed(registry: ToolRegistry, tool) -> None:
+                if not is_privileged and tool.name in admin_tools:
+                    return
+                registry.register(tool)
+
             # Build subagent tools (no message tool, no spawn tool)
             tools = ToolRegistry()
             allowed_dir = self.workspace if (self.restrict_to_workspace or self.exec_config.sandbox) else None
             extra_read = [BUILTIN_SKILLS_DIR] if allowed_dir else None
-            tools.register(ReadFileTool(workspace=self.workspace, allowed_dir=allowed_dir, extra_allowed_dirs=extra_read))
-            tools.register(WriteFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
-            tools.register(EditFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
-            tools.register(ListDirTool(workspace=self.workspace, allowed_dir=allowed_dir))
-            tools.register(GlobTool(workspace=self.workspace, allowed_dir=allowed_dir))
-            tools.register(GrepTool(workspace=self.workspace, allowed_dir=allowed_dir))
+            register_if_allowed(tools, ReadFileTool(workspace=self.workspace, allowed_dir=allowed_dir, extra_allowed_dirs=extra_read))
+            register_if_allowed(tools, WriteFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
+            register_if_allowed(tools, EditFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
+            register_if_allowed(tools, ListDirTool(workspace=self.workspace, allowed_dir=allowed_dir))
+            register_if_allowed(tools, GlobTool(workspace=self.workspace, allowed_dir=allowed_dir))
+            register_if_allowed(tools, GrepTool(workspace=self.workspace, allowed_dir=allowed_dir))
             if self.exec_config.enable:
-                tools.register(ExecTool(
+                register_if_allowed(tools, ExecTool(
                     working_dir=str(self.workspace),
                     timeout=self.exec_config.timeout,
                     restrict_to_workspace=self.restrict_to_workspace,
@@ -139,8 +153,8 @@ class SubagentManager:
                     path_append=self.exec_config.path_append,
                 ))
             if self.web_config.enable:
-                tools.register(WebSearchTool(config=self.web_config.search, proxy=self.web_config.proxy))
-                tools.register(WebFetchTool(proxy=self.web_config.proxy))
+                register_if_allowed(tools, WebSearchTool(config=self.web_config.search, proxy=self.web_config.proxy))
+                register_if_allowed(tools, WebFetchTool(proxy=self.web_config.proxy))
             system_prompt = self._build_subagent_prompt()
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},
