@@ -442,6 +442,7 @@ async def test_system_subagent_followup_is_persisted_before_prompt_assembly(tmp_
             [*initial_messages, {"role": "assistant", "content": "done"}],
             "stop",
             False,
+            {},
         )
 
     loop._run_agent_loop = fake_run_agent_loop  # type: ignore[method-assign]
@@ -491,6 +492,7 @@ async def test_multiple_subagent_followups_all_persist_as_standalone_history(tmp
             [*initial_messages, {"role": "assistant", "content": "ack"}],
             "stop",
             False,
+            {},
         )
 
     loop._run_agent_loop = fake_run_agent_loop  # type: ignore[method-assign]

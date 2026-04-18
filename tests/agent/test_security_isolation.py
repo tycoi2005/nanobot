@@ -3,6 +3,7 @@ import asyncio
 from unittest.mock import MagicMock, patch, AsyncMock
 import pytest
 from nanobot.agent.loop import AgentLoop
+from nanobot.agent.subagent import SubagentStatus
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.agent.runner import AgentRunSpec, AgentRunResult
@@ -223,8 +224,8 @@ class TestSecurityIsolation:
         # Verify unprivileged subagent
         with patch.object(mgr.runner, 'run', new_callable=AsyncMock) as mock_run:
             mock_run.return_value = MagicMock(stop_reason="stop", final_content="done")
-            
-            await mgr._run_subagent("sub-unprivileged", "do task", "label", {"channel": "test", "chat_id": "c1"}, is_privileged=False)
+            status = SubagentStatus(task_id="sub-unprivileged", label="label", task_description="do task", started_at=0.0)
+            await mgr._run_subagent("sub-unprivileged", "do task", "label", {"channel": "test", "chat_id": "c1"}, status, is_privileged=False)
             
             # Extract the tools passed to AgentRunner
             spec = mock_run.call_args.args[0]
@@ -242,8 +243,8 @@ class TestSecurityIsolation:
         
         with patch.object(mgr_priv.runner, 'run', new_callable=AsyncMock) as mock_run_priv:
             mock_run_priv.return_value = MagicMock(stop_reason="stop", final_content="done")
-            
-            await mgr_priv._run_subagent("sub-privileged", "do task", "label", {"channel": "test", "chat_id": "c1"}, is_privileged=True)
+            status_priv = SubagentStatus(task_id="sub-privileged", label="label", task_description="do task", started_at=0.0)
+            await mgr_priv._run_subagent("sub-privileged", "do task", "label", {"channel": "test", "chat_id": "c1"}, status_priv, is_privileged=True)
             
             # Privileged subagents have access to admin tools
             spec_priv = mock_run_priv.call_args.args[0]
