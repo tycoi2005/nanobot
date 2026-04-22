@@ -359,10 +359,16 @@ class AgentLoop:
 
     def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
         """Update context for all tools that need routing info."""
+        # Compute the effective session key (accounts for unified sessions)
+        # so that subagent results route to the correct pending queue.
+        effective_key = UNIFIED_SESSION_KEY if self._unified_session else f"{channel}:{chat_id}"
         for name in ("message", "spawn", "cron", "my"):
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
-                    tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))
+                    if name == "spawn":
+                        tool.set_context(channel, chat_id, effective_key=effective_key)
+                    else:
+                        tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
@@ -379,6 +385,36 @@ class AgentLoop:
         from nanobot.utils.tool_hints import format_tool_hints
 
         return format_tool_hints(tool_calls)
+
+    async def _dispatch_command_inline(
+        self,
+        msg: InboundMessage,
+        key: str,
+        raw: str,
+        dispatch_fn: Callable[[CommandContext], Awaitable[OutboundMessage | None]],
+    ) -> None:
+        """Dispatch a command directly from the run() loop and publish the result."""
+        ctx = CommandContext(msg=msg, session=None, key=key, raw=raw, loop=self)
+        result = await dispatch_fn(ctx)
+        if result:
+            await self.bus.publish_outbound(result)
+        else:
+            logger.warning("Command '{}' matched but dispatch returned None", raw)
+
+    async def _cancel_active_tasks(self, key: str) -> int:
+        """Cancel and await all active tasks and subagents for *key*.
+
+        Returns the total number of cancelled tasks + subagents.
+        """
+        tasks = self._active_tasks.pop(key, [])
+        cancelled = sum(1 for t in tasks if not t.done() and t.cancel())
+        for t in tasks:
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+        sub_cancelled = await self.subagents.cancel_by_session(key)
+        return cancelled + sub_cancelled
 
     def _is_strict_policy(self, channel_name: str) -> bool:
         """True if the channel has an explicit allow-list of user IDs."""
@@ -410,14 +446,14 @@ class AgentLoop:
         if not isinstance(cfg, dict):
             return False
         allow_from = cfg.get("allowFrom") or cfg.get("allow_from", [])
-        
+
         # Support "id|name" format by checking both the full string and just the ID part
         sender_str = str(sender_id)
         is_allowed = sender_str in allow_from
         if not is_allowed and "|" in sender_str:
             sid = sender_str.split("|")[0]
             is_allowed = sid in allow_from
-            
+
         logger.debug("Privilege check for {}:{}: {}", channel_name, sender_id, is_allowed)
         return is_allowed
 
@@ -448,7 +484,7 @@ class AgentLoop:
         message_id: str | None = None,
         pending_queue: asyncio.Queue | None = None,
         privileged: bool | None = None,
-    ) -> tuple[str | None, list[str], list[dict], str, bool]:
+    ) -> tuple[str | None, list[str], list[dict], str, bool, ToolRegistry]:
         """Run the agent iteration loop.
 
         *on_stream*: called with each content delta during streaming.
@@ -528,7 +564,8 @@ class AgentLoop:
                     elif name == "cron":
                         tool.set_context(channel, chat_id, sender_id)
                     elif name == "spawn":
-                        tool.set_context(channel, chat_id, is_privileged)
+                        effective_key = UNIFIED_SESSION_KEY if self._unified_session else f"{channel}:{chat_id}"
+                        tool.set_context(channel, chat_id, effective_key=effective_key, is_privileged=is_privileged)
                     
                 run_tools.register(tool)
 
@@ -615,10 +652,10 @@ class AgentLoop:
         """Handle an inbound message: priority commands, filters, and dispatching."""
         raw = msg.content.strip()
         if self.commands.is_priority(raw):
-            ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw=raw, loop=self)
-            result = await self.commands.dispatch_priority(ctx)
-            if result:
-                await self.bus.publish_outbound(result)
+            await self._dispatch_command_inline(
+                msg, msg.session_key, raw,
+                self.commands.dispatch_priority,
+            )
             return
 
         # Skip _store_only messages - they're for logging only, not processing
@@ -630,6 +667,14 @@ class AgentLoop:
         # is processing this session), route the message there for mid-turn
         # injection instead of creating a competing task.
         if effective_key in self._pending_queues:
+            # Non-priority commands must not be queued for injection;
+            # dispatch them directly (same pattern as priority commands).
+            if self.commands.is_dispatchable_command(raw):
+                await self._dispatch_command_inline(
+                    msg, effective_key, raw,
+                    self.commands.dispatch,
+                )
+                return
             pending_msg = msg
             if effective_key != msg.session_key:
                 pending_msg = dataclasses.replace(
@@ -725,6 +770,29 @@ class AgentLoop:
                         ))
                 except asyncio.CancelledError:
                     logger.info("Task cancelled for session {}", session_key)
+                    # Preserve partial context from the interrupted turn so
+                    # the user does not lose tool results and assistant
+                    # messages accumulated before /stop.  The checkpoint was
+                    # already persisted to session metadata by
+                    # _emit_checkpoint during tool execution; materializing
+                    # it into session history now makes it visible in the
+                    # next conversation turn.
+                    try:
+                        key = self._effective_session_key(msg)
+                        session = self.sessions.get_or_create(key)
+                        if self._restore_runtime_checkpoint(session):
+                            self._clear_pending_user_turn(session)
+                            self.sessions.save(session)
+                            logger.info(
+                                "Restored partial context for cancelled session {}",
+                                key,
+                            )
+                    except Exception:
+                        logger.debug(
+                            "Could not restore checkpoint for cancelled session {}",
+                            session_key,
+                            exc_info=True,
+                        )
                     raise
                 except Exception:
                     logger.exception("Error processing message for session {}", session_key)
@@ -801,8 +869,10 @@ class AgentLoop:
 
             session, pending = self.auto_compact.prepare_session(session, key)
 
-            await self.consolidator.maybe_consolidate_by_tokens(session)
-
+            await self.consolidator.maybe_consolidate_by_tokens(
+                session,
+                session_summary=pending,
+            )
             # Persist subagent follow-ups into durable history BEFORE prompt
             # assembly. ContextBuilder merges adjacent same-role messages for
             # provider compatibility, which previously caused the follow-up to
@@ -883,7 +953,10 @@ class AgentLoop:
         if result := await self.commands.dispatch(ctx):
             return result
 
-        await self.consolidator.maybe_consolidate_by_tokens(session)
+        await self.consolidator.maybe_consolidate_by_tokens(
+            session,
+            session_summary=pending,
+        )
 
         history = session.get_history(max_messages=0)
         is_privileged = privileged if privileged is not None else self._is_privileged(msg.channel, msg.sender_id)
