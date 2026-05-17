@@ -313,7 +313,7 @@ async def test_runner_returns_structured_tool_error():
 
 
 @pytest.mark.asyncio
-async def test_runner_stops_on_workspace_violation_without_fail_on_tool_error():
+async def test_runner_does_not_stop_on_workspace_violation_without_fail_on_tool_error():
     from nanobot.agent.runner import AgentRunSpec, AgentRunner
 
     provider = MagicMock()
@@ -340,9 +340,10 @@ async def test_runner_stops_on_workspace_violation_without_fail_on_tool_error():
         max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
     ))
 
-    assert provider.chat_with_retry.await_count == 1
-    assert result.stop_reason == "tool_error"
-    assert "outside allowed directory" in (result.error or "")
+    assert provider.chat_with_retry.await_count == 2
+    assert result.stop_reason != "tool_error"
+    assert result.error is None
+    assert result.final_content == "should not continue"
     assert result.tool_events == [
         {
             "name": "read_file",
