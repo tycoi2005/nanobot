@@ -109,6 +109,7 @@ class TurnContext:
     on_stream: Callable[[str], Awaitable[None]] | None = None
     on_stream_end: Callable[..., Awaitable[None]] | None = None
     on_retry_wait: Callable[[str], Awaitable[None]] | None = None
+    privileged: bool | None = None
 
     pending_queue: asyncio.Queue | None = None
     pending_summary: str | None = None
@@ -146,6 +147,19 @@ class AgentLoop:
 
     _RUNTIME_CHECKPOINT_KEY = "runtime_checkpoint"
     _PENDING_USER_TURN_KEY = "pending_user_turn"
+
+    # Tools that require explicit allowFrom privilege in strict channel configs.
+    DEFAULT_ADMIN_TOOLS = frozenset({
+        "read_file",
+        "write_file",
+        "edit_file",
+        "list_dir",
+        "grep",
+        "glob",
+        "exec",
+        "notebook_edit",
+        "spawn",
+    })
 
     # Event-driven state transition table.
     # Handlers return an event string; the driver looks up the next state here.
@@ -504,6 +518,9 @@ class AgentLoop:
         self, channel: str, chat_id: str,
         message_id: str | None = None, metadata: dict | None = None,
         session_key: str | None = None,
+        sender_id: str | None = None,
+        is_privileged: bool = True,
+        tools: ToolRegistry | None = None,
     ) -> None:
         """Update context for all tools that need routing info."""
         from nanobot.agent.tools.context import ContextAware, RequestContext
@@ -520,11 +537,14 @@ class AgentLoop:
             chat_id=chat_id,
             message_id=message_id,
             session_key=effective_key,
+            sender_id=sender_id,
+            is_privileged=is_privileged,
             metadata=dict(metadata or {}),
         )
 
-        for name in self.tools.tool_names:
-            tool = self.tools.get(name)
+        registry = tools or self.tools
+        for name in registry.tool_names:
+            tool = registry.get(name)
             if tool and isinstance(tool, ContextAware):
                 tool.set_context(request_ctx)
 
@@ -586,6 +606,8 @@ class AgentLoop:
         session: Session,
         history: list[dict[str, Any]],
         pending_summary: str | None,
+        *,
+        is_privileged: bool = True,
     ) -> list[dict[str, Any]]:
         """Build the initial message list for the LLM turn."""
         return self.context.build_messages(
@@ -597,6 +619,7 @@ class AgentLoop:
             sender_id=msg.sender_id,
             session_summary=pending_summary,
             session_metadata=session.metadata,
+            is_privileged=is_privileged,
         )
 
     async def _dispatch_command_inline(
@@ -627,6 +650,57 @@ class AgentLoop:
         sub_cancelled = await self.subagents.cancel_by_session(key)
         return cancelled + sub_cancelled
 
+    def _is_strict_policy(self, channel_name: str) -> bool:
+        """Return True when a channel has an explicit non-wildcard allowFrom policy."""
+        if channel_name == "cli":
+            return False
+        if not self.channels_config:
+            return False
+        cfg = getattr(self.channels_config, "model_extra", {}).get(channel_name)
+        if not isinstance(cfg, dict):
+            return False
+        allow_from = cfg.get("allowFrom") or cfg.get("allow_from") or []
+        if not allow_from:
+            return False
+        return not (len(allow_from) == 1 and allow_from[0] == "*")
+
+    def _is_privileged(self, channel_name: str, sender_id: str | None) -> bool:
+        """Check whether a sender may use admin tools and privileged prompt context."""
+        if channel_name == "cli":
+            return True
+        if not self._is_strict_policy(channel_name):
+            return True
+        if not self.channels_config or not sender_id:
+            return False
+
+        cfg = getattr(self.channels_config, "model_extra", {}).get(channel_name)
+        if not isinstance(cfg, dict):
+            return False
+        allow_from = cfg.get("allowFrom") or cfg.get("allow_from") or []
+        sender = str(sender_id)
+        return sender in allow_from or ("|" in sender and sender.split("|", 1)[0] in allow_from)
+
+    def _admin_tool_names(self) -> frozenset[str]:
+        configured = getattr(self.tools_config, "admin_tools", None)
+        if configured is None:
+            return self.DEFAULT_ADMIN_TOOLS
+        return frozenset(configured)
+
+    def _tools_for_privilege(self, *, is_privileged: bool) -> ToolRegistry:
+        """Return the tool registry visible to this request."""
+        if is_privileged:
+            return self.tools
+
+        admin_tools = self._admin_tool_names()
+        run_tools = ToolRegistry()
+        for name in self.tools.tool_names:
+            if name in admin_tools or name.startswith("mcp_"):
+                continue
+            tool = self.tools.get(name)
+            if tool is not None:
+                run_tools.register(tool)
+        return run_tools
+
     def _effective_session_key(self, msg: InboundMessage) -> str:
         """Return the session key used for task routing and mid-turn injections."""
         if self._unified_session and not msg.session_key_override:
@@ -656,10 +730,12 @@ class AgentLoop:
         session: Session | None = None,
         channel: str = "cli",
         chat_id: str = "direct",
+        sender_id: str | None = None,
         message_id: str | None = None,
         metadata: dict[str, Any] | None = None,
         session_key: str | None = None,
         pending_queue: asyncio.Queue | None = None,
+        privileged: bool | None = None,
     ) -> tuple[str | None, list[str], list[dict], str, bool]:
         """Run the agent iteration loop.
 
@@ -671,6 +747,22 @@ class AgentLoop:
         Returns (final_content, tools_used, messages, stop_reason, had_injections).
         """
         self._sync_subagent_runtime_limits()
+        is_privileged = (
+            privileged
+            if privileged is not None
+            else self._is_privileged(channel, sender_id)
+        )
+        run_tools = self._tools_for_privilege(is_privileged=is_privileged)
+        self._set_tool_context(
+            channel,
+            chat_id,
+            message_id,
+            metadata,
+            session_key=session_key,
+            sender_id=sender_id,
+            is_privileged=is_privileged,
+            tools=run_tools,
+        )
 
         loop_hook = AgentProgressHook(
             on_progress=on_progress,
@@ -681,8 +773,14 @@ class AgentLoop:
             message_id=message_id,
             metadata=metadata,
             session_key=session_key,
+            sender_id=sender_id,
+            is_privileged=is_privileged,
             tool_hint_max_length=self.tool_hint_max_length,
-            set_tool_context=self._set_tool_context,
+            set_tool_context=lambda *args, **kwargs: self._set_tool_context(
+                *args,
+                **kwargs,
+                tools=run_tools,
+            ),
             on_iteration=lambda iteration: setattr(self, "_current_iteration", iteration),
         )
         hook: AgentHook = (
@@ -750,7 +848,7 @@ class AgentLoop:
         try:
             result = await self.runner.run(AgentRunSpec(
                 initial_messages=initial_messages,
-                tools=self.tools,
+                tools=run_tools,
                 model=self.model,
                 max_iterations=self.max_iterations,
                 max_tool_result_chars=self.max_tool_result_chars,
@@ -1016,6 +1114,7 @@ class AgentLoop:
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
         pending_queue: asyncio.Queue | None = None,
+        privileged: bool | None = None,
     ) -> OutboundMessage | None:
         """Process a system inbound message (e.g. subagent announce)."""
         channel, chat_id = (
@@ -1041,9 +1140,15 @@ class AgentLoop:
         if is_subagent and self._persist_subagent_followup(session, msg):
             logger.debug("Subagent result persisted for session {}", key)
             self.sessions.save(session)
+        is_privileged = (
+            privileged
+            if privileged is not None
+            else self._is_privileged(channel, msg.sender_id)
+        )
         self._set_tool_context(
             channel, chat_id, msg.metadata.get("message_id"),
-            msg.metadata, session_key=key,
+            msg.metadata, session_key=key, sender_id=msg.sender_id,
+            is_privileged=is_privileged,
         )
         _hist_kwargs: dict[str, Any] = {
             "max_messages": self._max_messages,
@@ -1062,14 +1167,17 @@ class AgentLoop:
             sender_id=msg.sender_id,
             session_summary=pending,
             session_metadata=session.metadata,
+            is_privileged=is_privileged,
         )
         t_wall = time.time()
         final_content, _, all_msgs, stop_reason, _ = await self._run_agent_loop(
             messages, session=session, channel=channel, chat_id=chat_id,
+            sender_id=msg.sender_id,
             message_id=msg.metadata.get("message_id"),
             metadata=msg.metadata,
             session_key=key,
             pending_queue=pending_queue,
+            privileged=privileged,
         )
         wall_done = time.time()
         latency_ms = max(0, int((wall_done - t_wall) * 1000))
@@ -1106,6 +1214,7 @@ class AgentLoop:
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
         pending_queue: asyncio.Queue | None = None,
+        privileged: bool | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
         self._refresh_provider_snapshot()
@@ -1118,6 +1227,7 @@ class AgentLoop:
                 on_stream=on_stream,
                 on_stream_end=on_stream_end,
                 pending_queue=pending_queue,
+                privileged=privileged,
             )
 
         key = session_key or msg.session_key
@@ -1131,6 +1241,7 @@ class AgentLoop:
             on_stream=on_stream,
             on_stream_end=on_stream_end,
             pending_queue=pending_queue,
+            privileged=privileged,
         )
 
         while ctx.state is not TurnState.DONE:
@@ -1282,12 +1393,19 @@ class AgentLoop:
             ctx.session,
             replay_max_messages=self._max_messages,
         )
+        is_privileged = (
+            ctx.privileged
+            if ctx.privileged is not None
+            else self._is_privileged(ctx.msg.channel, ctx.msg.sender_id)
+        )
         self._set_tool_context(
             ctx.msg.channel,
             ctx.msg.chat_id,
             ctx.msg.metadata.get("message_id"),
             ctx.msg.metadata,
             session_key=ctx.session_key,
+            sender_id=ctx.msg.sender_id,
+            is_privileged=is_privileged,
         )
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
@@ -1306,7 +1424,11 @@ class AgentLoop:
         )
 
         ctx.initial_messages = self._build_initial_messages(
-            ctx.msg, ctx.session, ctx.history, ctx.pending_summary
+            ctx.msg,
+            ctx.session,
+            ctx.history,
+            ctx.pending_summary,
+            is_privileged=is_privileged,
         )
         ctx.user_persisted_early = self._persist_user_message_early(
             ctx.msg, ctx.session
@@ -1330,10 +1452,12 @@ class AgentLoop:
             session=ctx.session,
             channel=ctx.msg.channel,
             chat_id=ctx.msg.chat_id,
+            sender_id=ctx.msg.sender_id,
             message_id=ctx.msg.metadata.get("message_id"),
             metadata=ctx.msg.metadata,
             session_key=ctx.session_key,
             pending_queue=ctx.pending_queue,
+            privileged=ctx.privileged,
         )
         final_content, tools_used, all_msgs, stop_reason, had_injections = result
         ctx.final_content = final_content
@@ -1604,21 +1728,25 @@ class AgentLoop:
         session_key: str = "cli:direct",
         channel: str = "cli",
         chat_id: str = "direct",
+        sender_id: str = "user",
         media: list[str] | None = None,
         on_progress: Callable[..., Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        privileged: bool | None = None,
     ) -> OutboundMessage | None:
         """Process a message directly and return the outbound payload."""
         await self._connect_mcp()
         msg = InboundMessage(
-            channel=channel, sender_id="user", chat_id=chat_id,
+            channel=channel, sender_id=sender_id, chat_id=chat_id,
             content=content, media=media or [],
         )
-        return await self._process_message(
-            msg,
-            session_key=session_key,
-            on_progress=on_progress,
-            on_stream=on_stream,
-            on_stream_end=on_stream_end,
-        )
+        kwargs: dict[str, Any] = {
+            "session_key": session_key,
+            "on_progress": on_progress,
+            "on_stream": on_stream,
+            "on_stream_end": on_stream_end,
+        }
+        if privileged is not None:
+            kwargs["privileged"] = privileged
+        return await self._process_message(msg, **kwargs)

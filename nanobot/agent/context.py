@@ -39,43 +39,62 @@ class ContextBuilder:
         skill_names: list[str] | None = None,
         channel: str | None = None,
         session_summary: str | None = None,
+        is_privileged: bool = True,
     ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
-        parts = [self._get_identity(channel=channel)]
+        parts = [self._get_identity(channel=channel, is_privileged=is_privileged)]
 
-        bootstrap = self._load_bootstrap_files()
-        if bootstrap:
-            parts.append(bootstrap)
+        if is_privileged:
+            bootstrap = self._load_bootstrap_files()
+            if bootstrap:
+                parts.append(bootstrap)
 
-        memory = self.memory.get_memory_context()
-        if memory and not self._is_template_content(self.memory.read_memory(), "memory/MEMORY.md"):
-            parts.append(f"# Memory\n\n{memory}")
+            memory = self.memory.get_memory_context()
+            if memory and not self._is_template_content(self.memory.read_memory(), "memory/MEMORY.md"):
+                parts.append(f"# Memory\n\n{memory}")
 
-        always_skills = self.skills.get_always_skills()
-        if always_skills:
-            always_content = self.skills.load_skills_for_context(always_skills)
-            if always_content:
-                parts.append(f"# Active Skills\n\n{always_content}")
+            always_skills = self.skills.get_always_skills()
+            if always_skills:
+                always_content = self.skills.load_skills_for_context(always_skills)
+                if always_content:
+                    parts.append(f"# Active Skills\n\n{always_content}")
 
-        skills_summary = self.skills.build_skills_summary(exclude=set(always_skills))
-        if skills_summary:
-            parts.append(render_template("agent/skills_section.md", skills_summary=skills_summary))
+            skills_summary = self.skills.build_skills_summary(exclude=set(always_skills))
+            if skills_summary:
+                parts.append(
+                    render_template(
+                        "agent/skills_section.md",
+                        skills_summary=skills_summary,
+                        is_privileged=is_privileged,
+                    )
+                )
 
-        entries = self.memory.read_unprocessed_history(since_cursor=self.memory.get_last_dream_cursor())
-        if entries:
-            capped = entries[-self._MAX_RECENT_HISTORY:]
-            history_text = "\n".join(
-                f"- [{e['timestamp']}] {e['content']}" for e in capped
+            entries = self.memory.read_unprocessed_history(
+                since_cursor=self.memory.get_last_dream_cursor()
             )
-            history_text = truncate_text(history_text, self._MAX_HISTORY_CHARS)
-            parts.append("# Recent History\n\n" + history_text)
+            if entries:
+                capped = entries[-self._MAX_RECENT_HISTORY:]
+                history_text = "\n".join(
+                    f"- [{e['timestamp']}] {e['content']}" for e in capped
+                )
+                history_text = truncate_text(history_text, self._MAX_HISTORY_CHARS)
+                parts.append("# Recent History\n\n" + history_text)
+        else:
+            parts.append(
+                "# Restricted Mode\n\n"
+                "You are currently in restricted mode for security reasons. "
+                "Do not access or discuss local files, workspace paths, server "
+                "configuration, long-term memory, skills, or private data about "
+                "the owner or other users. If asked to perform privileged actions "
+                "or reveal system details, politely refuse."
+            )
 
         if session_summary:
             parts.append(f"[Archived Context Summary]\n\n{session_summary}")
 
         return "\n\n---\n\n".join(parts)
 
-    def _get_identity(self, channel: str | None = None) -> str:
+    def _get_identity(self, channel: str | None = None, is_privileged: bool = True) -> str:
         """Get the core identity section."""
         workspace_path = str(self.workspace.expanduser().resolve())
         system = platform.system()
@@ -87,6 +106,7 @@ class ContextBuilder:
             runtime=runtime,
             platform_policy=render_template("agent/platform_policy.md", system=system),
             channel=channel or "",
+            is_privileged=is_privileged,
         )
 
     @staticmethod
@@ -154,6 +174,7 @@ class ContextBuilder:
         sender_id: str | None = None,
         session_summary: str | None = None,
         session_metadata: Mapping[str, Any] | None = None,
+        is_privileged: bool = True,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         extra = goal_state_runtime_lines(session_metadata)
@@ -175,7 +196,15 @@ class ContextBuilder:
         else:
             merged = user_content + [{"type": "text", "text": runtime_ctx}]
         messages = [
-            {"role": "system", "content": self.build_system_prompt(skill_names, channel=channel, session_summary=session_summary)},
+            {
+                "role": "system",
+                "content": self.build_system_prompt(
+                    skill_names,
+                    channel=channel,
+                    session_summary=session_summary,
+                    is_privileged=is_privileged,
+                ),
+            },
             *history,
         ]
         if messages[-1].get("role") == current_role:
@@ -210,4 +239,3 @@ class ContextBuilder:
         if not images:
             return text
         return images + [{"type": "text", "text": text}]
-

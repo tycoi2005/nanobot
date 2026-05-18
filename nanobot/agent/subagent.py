@@ -68,6 +68,18 @@ class _SubagentHook(AgentHook):
 class SubagentManager:
     """Manages background subagent execution."""
 
+    DEFAULT_ADMIN_TOOLS = frozenset({
+        "read_file",
+        "write_file",
+        "edit_file",
+        "list_dir",
+        "grep",
+        "glob",
+        "exec",
+        "notebook_edit",
+        "spawn",
+    })
+
     def __init__(
         self,
         provider: LLMProvider,
@@ -114,6 +126,8 @@ class SubagentManager:
         self,
         workspace: Path | None = None,
         tools_config: ToolsConfig | None = None,
+        *,
+        is_privileged: bool = True,
     ) -> ToolRegistry:
         """Build an isolated subagent tool registry via ToolLoader."""
         root = self.workspace if workspace is None else workspace
@@ -125,6 +139,15 @@ class SubagentManager:
             file_state_store=FileStates(),
         )
         ToolLoader().load(ctx, registry, scope="subagent")
+        if not is_privileged:
+            admin_tools = (
+                self.DEFAULT_ADMIN_TOOLS
+                if self.tools_config.admin_tools is None
+                else frozenset(self.tools_config.admin_tools)
+            )
+            for name in list(registry.tool_names):
+                if name in admin_tools or name.startswith("mcp_"):
+                    registry.unregister(name)
         return registry
 
     def set_provider(self, provider: LLMProvider, model: str) -> None:
@@ -140,6 +163,7 @@ class SubagentManager:
         origin_chat_id: str = "direct",
         session_key: str | None = None,
         origin_message_id: str | None = None,
+        is_privileged: bool = True,
     ) -> str:
         """Spawn a subagent to execute a task in the background."""
         task_id = str(uuid.uuid4())[:8]
@@ -155,7 +179,15 @@ class SubagentManager:
         self._task_statuses[task_id] = status
 
         bg_task = asyncio.create_task(
-            self._run_subagent(task_id, task, display_label, origin, status, origin_message_id)
+            self._run_subagent(
+                task_id,
+                task,
+                display_label,
+                origin,
+                status,
+                origin_message_id,
+                is_privileged=is_privileged,
+            )
         )
         self._running_tasks[task_id] = bg_task
         if session_key:
@@ -182,6 +214,7 @@ class SubagentManager:
         origin: dict[str, str],
         status: SubagentStatus,
         origin_message_id: str | None = None,
+        is_privileged: bool = True,
     ) -> None:
         """Execute the subagent task and announce the result."""
         logger.info("Subagent [{}] starting task: {}", task_id, label)
@@ -191,7 +224,7 @@ class SubagentManager:
             status.iteration = payload.get("iteration", status.iteration)
 
         try:
-            tools = self._build_tools()
+            tools = self._build_tools(is_privileged=is_privileged)
             system_prompt = self._build_subagent_prompt()
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},
